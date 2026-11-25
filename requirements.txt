@@ -5,3 +5,5 @@ scikit-learn==1.9.1
 numpy
 pymupdf
 rapidocr-onnxruntime
+requests
+pillow

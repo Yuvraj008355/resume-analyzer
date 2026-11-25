@@ -22,7 +22,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024  # 5 MB
 db.init_db()
 
-# OCR engine for scanned PDFs and images (loaded only when needed)
+# Local OCR engine for scanned PDFs and images (loaded only when needed)
 OCR_ENGINE = None
 
 
@@ -126,12 +126,50 @@ def extract_text_from_pdf(data):
     return "\n".join((page.extract_text() or "") for page in reader.pages)
 
 
-def ocr_document(data, filetype, max_pages=3):
+def page_to_jpeg(page, max_side=1600):
+    """Render a page as a JPEG under 900 KB (the free OCR API limit is 1 MB)."""
+    from PIL import Image
+    zoom = min(2, max_side / max(page.rect.width, page.rect.height))
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    quality = 80
+    while True:
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=quality)
+        if buf.tell() < 900_000 or quality <= 30:
+            return buf.getvalue()
+        quality -= 15
+
+
+def ocr_space_api(img_bytes, api_key):
+    """Send one page image to the OCR.space API and return the text."""
+    import requests
+    resp = requests.post(
+        "https://api.ocr.space/parse/image",
+        files={"file": ("page.jpg", img_bytes, "image/jpeg")},
+        data={"apikey": api_key, "language": "eng", "OCREngine": "2"},
+        timeout=60,
+    )
+    body = resp.json()
+    if body.get("IsErroredOnProcessing"):
+        raise ValueError(str(body.get("ErrorMessage")))
+    return "\n".join(r.get("ParsedText", "") for r in body.get("ParsedResults", []))
+
+
+def ocr_document(data, filetype, max_pages=2):
     """Read text from a scanned PDF or an image using OCR."""
+    api_key = os.environ.get("OCR_SPACE_API_KEY")
+    doc = fitz.open(stream=data, filetype=filetype)
+
+    # Online OCR: used on the live server (no heavy model in memory)
+    if api_key:
+        pages = list(doc)[:max_pages]
+        return "\n".join(ocr_space_api(page_to_jpeg(p), api_key) for p in pages)
+
+    # Local OCR: used on your own computer
     engine = get_ocr_engine()
     if engine is None:
         raise RuntimeError("OCR not installed")
-    doc = fitz.open(stream=data, filetype=filetype)
     lines = []
     for page in list(doc)[:max_pages]:
         zoom = min(2, 2000 / max(page.rect.width, page.rect.height))
